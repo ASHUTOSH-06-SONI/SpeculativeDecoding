@@ -95,7 +95,10 @@ def speculative_loop(args):
     total_tokens_generated = 0
     total_proposals = 0
     total_accepted = 0
-    times = []
+    total_draft_time = 0.0
+    total_verifier_time = 0.0
+    verifier_calls = 0
+    block_times = []
     start_global = time.time()
 
     # we will run N_steps iterations (blocks)
@@ -105,13 +108,26 @@ def speculative_loop(args):
         proposals, q_logps = drafter_propose_block(tok, model, device, context_text, args.block_size, args.top_p, args.temperature)
         total_proposals += len(proposals)
         t_after_draft = time.time()
+        draft_time = t_after_draft - t_block_start
+        total_draft_time += draft_time
 
         if args.dry_run:
-            # if dry_run, don't call verifier; pretend p_logprobs = q_logps (forced accept)
-            p_logps = q_logps
+        # Force alpha = 1 for every proposal.
+        # Makes dry-run a sanity test of the pipeline.
+            p_logps = [q + math.log(args.M) + 100.0 for q in q_logps]
+            verifier_time = 0.0
         else:
             # 2) call verifier server for p_logprobs sequentially computed by verifier
+            t_before_verifier = time.time()
             p_logps = call_verifier(args.verifier_url, context_text, proposals, timeout=args.timeout)
+            if len(p_logps) != len(proposals):
+                raise RuntimeError(
+                    f"Verifier returned {len(p_logps)} logprobs "
+                    f"for {len(proposals)} proposals"
+                )
+            verifier_time = time.time() - t_before_verifier
+            total_verifier_time += verifier_time
+            verifier_calls += 1
 
         # 3) acceptance tests (sequential)
         accepted_in_block = 0
@@ -123,7 +139,7 @@ def speculative_loop(args):
             # log_alpha = min(0, (p - q) - log(M))
             log_ratio = p - q
             log_M = math.log(args.M)
-            log_alpha = min(0.0, log_ratio - log_M)
+            log_alpha = min(1.0, log_ratio - log_M)
             # accept with probability exp(log_alpha)
             accept_prob = math.exp(log_alpha)
             u = random.random()
@@ -142,11 +158,16 @@ def speculative_loop(args):
         # update counters and timing
         total_tokens_generated += accepted_in_block
         t_block_end = time.time()
-        times.append(t_block_end - t_block_start)
+        block_time = t_block_end - t_block_start
+        block_times.append(block_time)
 
         # logs
         print(f"[block {step+1}/{args.num_blocks}] proposed={len(proposals)}, accepted_in_block={accepted_in_block}, cumulative_accepted={total_accepted}", flush=True)
-        print(f"  draft_time={t_after_draft - t_block_start:.3f}s, block_time={t_block_end - t_block_start:.3f}s, accept_rate_block={accepted_in_block/len(proposals):.3f}", flush=True)
+        print(
+            f"  draft_time={draft_time:.3f}s, verifier_time={verifier_time:.3f}s, "
+            f"block_time={block_time:.3f}s, accept_rate_block={accepted_in_block/len(proposals):.3f}",
+            flush=True,
+        )
         if args.verbose:
             for i, tokid in enumerate(proposals):
                 p = p_logps[i]
@@ -159,20 +180,53 @@ def speculative_loop(args):
             break
 
     elapsed = time.time() - start_global
+    avg_block_time = sum(block_times) / len(block_times) if block_times else 0.0
+    avg_accepted_per_block = total_accepted / len(block_times) if block_times else 0.0
+    avg_proposals_per_block = total_proposals / len(block_times) if block_times else 0.0
+    acceptance_rate = total_accepted / total_proposals if total_proposals > 0 else 0.0
+    avg_accepted_per_verifier = total_accepted / verifier_calls if verifier_calls > 0 else 0.0
+    sequential_verifier_savings = 1.0 - (verifier_calls / total_accepted) if total_accepted > 0 else 0.0
+    work_units = total_proposals + verifier_calls
+    work_efficiency = total_accepted / work_units if work_units > 0 else 0.0
+    accepted_tps = (
+    total_accepted / elapsed
+        if elapsed > 0 else 0.0
+    )
+    proposal_tps = (
+        total_proposals / elapsed
+        if elapsed > 0 else 0.0
+    )
+
     print("\n=== Summary ===", flush=True)
+    print(f"Accepted tokens/sec: {accepted_tps:.3f}")
+    print(f"Proposals/sec: {proposal_tps:.3f}")
     print(f"Total wall time: {elapsed:.3f}s", flush=True)
     print(f"Total accepted tokens: {total_accepted}", flush=True)
     print(f"Total proposals: {total_proposals}", flush=True)
-    print(f"Overall acceptance rate: {total_accepted/total_proposals if total_proposals>0 else 0:.3f}", flush=True)
-    print(f"Avg block time: {sum(times)/len(times) if times else 0:.4f}s", flush=True)
-    print(f"Tokens/sec (accepted): {total_accepted/elapsed:.3f}", flush=True)
+    print(f"Verifier calls: {verifier_calls}", flush=True)
+    print(f"Overall acceptance rate: {acceptance_rate:.3f}", flush=True)
+    print(f"Avg accepted per block: {avg_accepted_per_block:.3f}", flush=True)
+    print(f"Avg proposals per block: {avg_proposals_per_block:.3f}", flush=True)
+    print(f"Avg accepted per verifier call: {avg_accepted_per_verifier:.3f}", flush=True)
+    print(f"Sequential verifier savings: {sequential_verifier_savings:.3%}", flush=True)
+    print(f"Estimated work efficiency (accepted/work-unit): {work_efficiency:.3f}", flush=True)
+    print(f"Avg block time: {avg_block_time:.4f}s", flush=True)
+    print(f"Total draft time: {total_draft_time:.3f}s", flush=True)
+    print(f"Total verifier time: {total_verifier_time:.3f}s", flush=True)
+    print(f"Accepted tokens/sec: {total_accepted/elapsed:.3f}", flush=True)
+    print(f"Proposals/sec: {total_proposals/elapsed:.3f}", flush=True)
 
 def parse_args():
     p = argparse.ArgumentParser()
     p.add_argument("--verifier_url", type=str, default=None, help="Verifier endpoint e.g. http://host:8000/verify")
     p.add_argument("--prompt", type=str, default="Translate to Hindi: Hello, how are you?", help="Initial context/prompt text")
     p.add_argument("--block_size", type=int, default=4)
-    p.add_argument("--M", type=float, default=10.0, help="Conservative bound M (>= sup_x p/q). Tune on validation.")
+    p.add_argument(
+        "--M",
+        type=float,
+        default=1.0,
+        help="Acceptance bound M (>= sup_x p/q). Start with 1.0 and tune later."
+    )  
     p.add_argument("--top_p", type=float, default=0.95)
     p.add_argument("--temperature", type=float, default=1.0)
     p.add_argument("--num_blocks", type=int, default=100, help="Number of drafter blocks to run")
