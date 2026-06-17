@@ -1,0 +1,8 @@
+torch
+transformers
+fastapi
+uvicorn
+requests
+pandas
+datasets
+huggingface_hub

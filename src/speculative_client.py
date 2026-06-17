@@ -18,7 +18,7 @@ import requests
 import torch
 from transformers import AutoTokenizer, AutoModelForCausalLM
 
-DEFAULT_DRAFTER = "google/gemma-3-270m"   # will fallback if gated access fails (script tries)
+DEFAULT_DRAFTER = "gpt2"   
 VERIFIER_URL = None  # set via CLI
 
 def load_local_drafter(candidate=DEFAULT_DRAFTER):
